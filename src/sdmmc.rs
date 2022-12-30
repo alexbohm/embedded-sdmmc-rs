@@ -8,23 +8,29 @@
 use super::sdmmc_proto::*;
 use super::{Block, BlockCount, BlockDevice, BlockIdx};
 use core::cell::RefCell;
-use nb::block;
 
 const DEFAULT_DELAY_COUNT: u32 = 32_000;
+
+// A dummy write buffer used for writing out data when we are doing a read operation.
+// Must be 0xff.
+// TODO: ESP32
+static DUMMY_WRITE_BUFFER: [u8; 512] = [0xffu8; 512];
 
 /// Represents an SD Card interface built from an SPI peripheral and a Chip
 /// Select pin. We need Chip Select to be separate so we can clock out some
 /// bytes without Chip Select asserted (which puts the card into SPI mode).
-pub struct SdMmcSpi<SPI, CS>
+pub struct SdMmcSpi<SPI>
 where
-    SPI: embedded_hal::spi::FullDuplex<u8>,
-    CS: embedded_hal::digital::v2::OutputPin,
-    <SPI as embedded_hal::spi::FullDuplex<u8>>::Error: core::fmt::Debug,
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    <SPI as embedded_hal::spi::ErrorType>::Error: core::fmt::Debug,
 {
     spi: RefCell<SPI>,
-    cs: RefCell<CS>,
     card_type: CardType,
     state: State,
+
+    // TODO: some drivers seem to not properly work when given an empty read buffer to discard
+    // data. This is a location where we can just dump garbage read data.
+    garbage_read_buffer: RefCell<[u8; 512]>,
 }
 
 /// The possible errors `SdMmcSpi` can generate.
@@ -101,19 +107,19 @@ impl Delay {
     }
 }
 
-impl<SPI, CS> SdMmcSpi<SPI, CS>
+impl<SPI> SdMmcSpi<SPI>
 where
-    SPI: embedded_hal::spi::FullDuplex<u8>,
-    CS: embedded_hal::digital::v2::OutputPin,
-    <SPI as embedded_hal::spi::FullDuplex<u8>>::Error: core::fmt::Debug,
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    <SPI as embedded_hal::spi::ErrorType>::Error: core::fmt::Debug,
 {
     /// Create a new SD/MMC controller using a raw SPI interface.
-    pub fn new(spi: SPI, cs: CS) -> SdMmcSpi<SPI, CS> {
+    pub fn new(spi: SPI) -> SdMmcSpi<SPI> {
         SdMmcSpi {
             spi: RefCell::new(spi),
-            cs: RefCell::new(cs),
+            // cs: RefCell::new(cs),
             card_type: CardType::SD1,
             state: State::NoInit,
+            garbage_read_buffer: RefCell::new([0x00u8; 512]),
         }
     }
 
@@ -123,16 +129,16 @@ where
         self.spi.borrow_mut()
     }
 
-    fn cs_high(&self) -> Result<(), Error> {
-        self.cs
-            .borrow_mut()
-            .set_high()
-            .map_err(|_| Error::GpioError)
-    }
+    // fn cs_high(&self) -> Result<(), Error> {
+    //     self.cs
+    //         .borrow_mut()
+    //         .set_high()
+    //         .map_err(|_| Error::GpioError)
+    // }
 
-    fn cs_low(&self) -> Result<(), Error> {
-        self.cs.borrow_mut().set_low().map_err(|_| Error::GpioError)
-    }
+    // fn cs_low(&self) -> Result<(), Error> {
+    //     self.cs.borrow_mut().set_low().map_err(|_| Error::GpioError)
+    // }
 
     /// This routine must be performed with an SPI clock speed of around 100 - 400 kHz.
     /// Afterwards you may increase the SPI clock speed.
@@ -140,13 +146,15 @@ where
         let f = |s: &mut Self| {
             // Assume it hasn't worked
             s.state = State::Error;
-            // Supply minimum of 74 clock cycles without CS asserted.
-            s.cs_high()?;
+
+            // TODO: // Supply minimum of 74 clock cycles without CS asserted.
+            // s.cs_high()?;
             for _ in 0..10 {
                 s.send(0xFF)?;
             }
-            // Assert CS
-            s.cs_low()?;
+            // // Assert CS
+            // s.cs_low()?;
+
             // Enter SPI mode
             let mut attempts = 32;
             while attempts > 0 {
@@ -217,7 +225,7 @@ where
             Ok(())
         };
         let result = f(self);
-        self.cs_high()?;
+        // self.cs_high()?;
         let _ = self.receive();
         result
     }
@@ -230,13 +238,13 @@ where
     /// Return the usable size of this SD card in bytes.
     pub fn card_size_bytes(&self) -> Result<u64, Error> {
         self.check_state()?;
-        self.with_chip_select(|s| {
-            let csd = s.read_csd()?;
-            match csd {
-                Csd::V1(ref contents) => Ok(contents.card_capacity_bytes()),
-                Csd::V2(ref contents) => Ok(contents.card_capacity_bytes()),
-            }
-        })
+        // self.with_chip_select(|s| {
+        let csd = self.read_csd()?;
+        match csd {
+            Csd::V1(ref contents) => Ok(contents.card_capacity_bytes()),
+            Csd::V2(ref contents) => Ok(contents.card_capacity_bytes()),
+        }
+        // })
     }
 
     /// Erase some blocks on the card.
@@ -248,13 +256,13 @@ where
     /// Can this card erase single blocks?
     pub fn erase_single_block_enabled(&self) -> Result<bool, Error> {
         self.check_state()?;
-        self.with_chip_select(|s| {
-            let csd = s.read_csd()?;
-            match csd {
-                Csd::V1(ref contents) => Ok(contents.erase_single_block_enabled()),
-                Csd::V2(ref contents) => Ok(contents.erase_single_block_enabled()),
-            }
-        })
+        // self.with_chip_select(|s| {
+        let csd = self.read_csd()?;
+        match csd {
+            Csd::V1(ref contents) => Ok(contents.erase_single_block_enabled()),
+            Csd::V2(ref contents) => Ok(contents.erase_single_block_enabled()),
+        }
+        // })
     }
 
     /// Return an error if we're not in  `State::Idle`. It probably means
@@ -267,29 +275,29 @@ where
         }
     }
 
-    /// Perform a function that might error with the chipselect low.
-    /// Always releases the chipselect, even if the function errors.
-    fn with_chip_select_mut<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&Self) -> Result<T, Error>,
-    {
-        self.cs_low()?;
-        let result = func(self);
-        self.cs_high()?;
-        result
-    }
+    // /// Perform a function that might error with the chipselect low.
+    // /// Always releases the chipselect, even if the function errors.
+    // fn with_chip_select_mut<F, T>(&self, func: F) -> Result<T, Error>
+    // where
+    //     F: FnOnce(&Self) -> Result<T, Error>,
+    // {
+    //     self.cs_low()?;
+    //     let result = func(self);
+    //     self.cs_high()?;
+    //     result
+    // }
 
-    /// Perform a function that might error with the chipselect low.
-    /// Always releases the chipselect, even if the function errors.
-    fn with_chip_select<F, T>(&self, func: F) -> Result<T, Error>
-    where
-        F: FnOnce(&Self) -> Result<T, Error>,
-    {
-        self.cs_low()?;
-        let result = func(self);
-        self.cs_high()?;
-        result
-    }
+    // /// Perform a function that might error with the chipselect low.
+    // /// Always releases the chipselect, even if the function errors.
+    // fn with_chip_select<F, T>(&self, func: F) -> Result<T, Error>
+    // where
+    //     F: FnOnce(&Self) -> Result<T, Error>,
+    // {
+    //     self.cs_low()?;
+    //     let result = func(self);
+    //     self.cs_high()?;
+    //     result
+    // }
 
     /// Read the 'card specific data' block.
     fn read_csd(&self) -> Result<Csd, Error> {
@@ -329,13 +337,26 @@ where
             return Err(Error::ReadError);
         }
 
-        for b in buffer.iter_mut() {
-            *b = self.receive()?;
-        }
+        // for b in buffer.iter_mut() {
+        //     *b = self.receive()?;
+        // }
+        let crc = {
+            let mut spi = self.spi.borrow_mut();
+            spi.transfer(buffer, &DUMMY_WRITE_BUFFER[..buffer.len()])
+                .map_err(|_e| Error::Transport)?;
 
-        let mut crc = u16::from(self.receive()?);
-        crc <<= 8;
-        crc |= u16::from(self.receive()?);
+            let mut crc_buffer = [0u8; 2];
+            spi.transfer(&mut crc_buffer, &DUMMY_WRITE_BUFFER[..2])
+                .map_err(|_e| Error::Transport)?;
+
+            u16::from_be_bytes(crc_buffer)
+        };
+
+        // let mut crc = u16::from(self.receive()?);
+        // crc <<= 8;
+        // crc |= u16::from(self.receive()?);
+
+        // println!("Read Data Buffer: {buffer:?}");
 
         let calc_crc = crc16(buffer);
         if crc != calc_crc {
@@ -349,11 +370,23 @@ where
     fn write_data(&self, token: u8, buffer: &[u8]) -> Result<(), Error> {
         let calc_crc = crc16(buffer);
         self.send(token)?;
-        for &b in buffer.iter() {
-            self.send(b)?;
+        // for &b in buffer.iter() {
+        //     self.send(b)?;
+        // }
+
+        {
+            let mut spi = self.spi.borrow_mut();
+            let mut garbage_read_buffer = self.garbage_read_buffer.borrow_mut();
+
+            spi.transfer(&mut garbage_read_buffer[..buffer.len()], buffer)
+                .map_err(|_e| Error::Transport)?;
+
+            spi.transfer(&mut garbage_read_buffer[..2], &calc_crc.to_be_bytes())
+                .map_err(|_e| Error::Transport)?;
         }
-        self.send((calc_crc >> 8) as u8)?;
-        self.send(calc_crc as u8)?;
+        // self.send((calc_crc >> 8) as u8)?;
+        // self.send(calc_crc as u8)?;
+
         let status = self.receive()?;
         if (status & DATA_RES_MASK) != DATA_RES_ACCEPTED {
             Err(Error::WriteError)
@@ -381,8 +414,12 @@ where
         ];
         buf[5] = crc7(&buf[0..5]);
 
-        for b in buf.iter() {
-            self.send(*b)?;
+        // for b in buf.iter() {
+        //     self.send(*b)?;
+        // }
+        {
+            let mut spi = self.spi.borrow_mut();
+            spi.transfer(&mut [], &buf).map_err(|_e| Error::Transport)?;
         }
 
         // skip stuff byte for stop read
@@ -402,7 +439,9 @@ where
 
     /// Receive a byte from the SD card by clocking in an 0xFF byte.
     fn receive(&self) -> Result<u8, Error> {
-        self.transfer(0xFF)
+        let b = self.transfer(0xFF)?;
+        // println!("receive() = {b}");
+        Ok(b)
     }
 
     /// Send a byte from the SD card.
@@ -414,8 +453,15 @@ where
     /// Send one byte and receive one byte.
     fn transfer(&self, out: u8) -> Result<u8, Error> {
         let mut spi = self.spi.borrow_mut();
-        block!(spi.send(out)).map_err(|_e| Error::Transport)?;
-        block!(spi.read()).map_err(|_e| Error::Transport)
+
+        // block!(spi.send(out)).map_err(|_e| Error::Transport)?;
+        // block!(spi.read()).map_err(|_e| Error::Transport)
+        let mut data: [u8; 1] = [0x00];
+
+        spi.transfer(&mut data, &[out])
+            .map_err(|_e| Error::Transport)?;
+
+        Ok(data[0])
     }
 
     /// Spin until the card returns 0xFF, or we spin too many times and
@@ -433,11 +479,10 @@ where
     }
 }
 
-impl<SPI, CS> BlockDevice for SdMmcSpi<SPI, CS>
+impl<SPI> BlockDevice for SdMmcSpi<SPI>
 where
-    SPI: embedded_hal::spi::FullDuplex<u8>,
-    <SPI as embedded_hal::spi::FullDuplex<u8>>::Error: core::fmt::Debug,
-    CS: embedded_hal::digital::v2::OutputPin,
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    <SPI as embedded_hal::spi::ErrorType>::Error: core::fmt::Debug,
 {
     type Error = Error;
 
@@ -453,22 +498,23 @@ where
             CardType::SD1 | CardType::SD2 => start_block_idx.0 * 512,
             CardType::SDHC => start_block_idx.0,
         };
-        self.with_chip_select(|s| {
-            if blocks.len() == 1 {
-                // Start a single-block read
-                s.card_command(CMD17, start_idx)?;
-                s.read_data(&mut blocks[0].contents)?;
-            } else {
-                // Start a multi-block read
-                s.card_command(CMD18, start_idx)?;
-                for block in blocks.iter_mut() {
-                    s.read_data(&mut block.contents)?;
-                }
-                // Stop the read
-                s.card_command(CMD12, 0)?;
+        // self.with_chip_select(|s| {
+
+        if blocks.len() == 1 {
+            // Start a single-block read
+            self.card_command(CMD17, start_idx)?;
+            self.read_data(&mut blocks[0].contents)?;
+        } else {
+            // Start a multi-block read
+            self.card_command(CMD18, start_idx)?;
+            for block in blocks.iter_mut() {
+                self.read_data(&mut block.contents)?;
             }
-            Ok(())
-        })
+            // Stop the read
+            self.card_command(CMD12, 0)?;
+        }
+        Ok(())
+        // })
     }
 
     /// Write one or more blocks, starting at the given block index.
@@ -478,31 +524,33 @@ where
             CardType::SD1 | CardType::SD2 => start_block_idx.0 * 512,
             CardType::SDHC => start_block_idx.0,
         };
-        self.with_chip_select_mut(|s| {
-            if blocks.len() == 1 {
-                // Start a single-block write
-                s.card_command(CMD24, start_idx)?;
-                s.write_data(DATA_START_BLOCK, &blocks[0].contents)?;
-                s.wait_not_busy()?;
-                if s.card_command(CMD13, 0)? != 0x00 {
-                    return Err(Error::WriteError);
-                }
-                if s.receive()? != 0x00 {
-                    return Err(Error::WriteError);
-                }
-            } else {
-                // Start a multi-block write
-                s.card_command(CMD25, start_idx)?;
-                for block in blocks.iter() {
-                    s.wait_not_busy()?;
-                    s.write_data(WRITE_MULTIPLE_TOKEN, &block.contents)?;
-                }
-                // Stop the write
-                s.wait_not_busy()?;
-                s.send(STOP_TRAN_TOKEN)?;
+        // self.with_chip_select_mut(|s| {
+        if blocks.len() == 1 {
+            // Start a single-block write
+            self.card_command(CMD24, start_idx)?;
+            self.write_data(DATA_START_BLOCK, &blocks[0].contents)?;
+            self.wait_not_busy()?;
+            if self.card_command(CMD13, 0)? != 0x00 {
+                // println!("CMD13 not zero.");
+                return Err(Error::WriteError);
             }
-            Ok(())
-        })
+            if self.receive()? != 0x00 {
+                // println!("Receive after CMD13 not zero");
+                return Err(Error::WriteError);
+            }
+        } else {
+            // Start a multi-block write
+            self.card_command(CMD25, start_idx)?;
+            for block in blocks.iter() {
+                self.wait_not_busy()?;
+                self.write_data(WRITE_MULTIPLE_TOKEN, &block.contents)?;
+            }
+            // Stop the write
+            self.wait_not_busy()?;
+            self.send(STOP_TRAN_TOKEN)?;
+        }
+        Ok(())
+        // })
     }
 
     /// Determine how many blocks this device can hold.
